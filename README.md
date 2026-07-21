@@ -27,6 +27,17 @@ idf.py build
 
 首次编译时，ESP-IDF 会根据 `dependencies.lock` 下载依赖组件。
 
+编译成功后会生成：
+
+```text
+firmware/esp-idf/06_codex_brookesia/build/esp-brookesia.bin
+firmware/esp-idf/06_codex_brookesia/build/bootloader/bootloader.bin
+firmware/esp-idf/06_codex_brookesia/build/partition_table/partition-table.bin
+```
+
+连接开发板后可以使用 `idf.py -p COMx flash` 烧录 Codex 固件。
+首次烧录前请确认分区表和设备容量匹配，并备份原厂固件。
+
 ## Wi-Fi
 
 固件默认优先读取原厂固件保存的共享 Wi-Fi 配置，不需要把密码写进源码。
@@ -61,6 +72,13 @@ $env:IDF_PYTHON_ENV_PATH = "你的 ESP-IDF Python 环境路径"
 ```
 
 日常切换也可以使用开发板按键，不需要重新编译。
+
+## 复现范围
+
+从本仓库可以重新编译出 Codex 面板和电脑端桥接程序，界面与本项目源码版本一致。
+但本仓库不会单独恢复原厂桌面、小智固件、原厂资源分区或你的设备 Wi-Fi 配置。
+要获得“原厂桌面 + 小智 + Codex”组合，仍需要设备原本的 Waveshare 原厂固件，
+并按照 `dual_firmware/` 中的分区和切换说明操作。
 
 ## 开源范围
 
