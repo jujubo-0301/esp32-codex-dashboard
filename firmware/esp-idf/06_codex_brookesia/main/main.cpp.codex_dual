@@ -1,0 +1,31 @@
+#include "bsp/esp-bsp.h"
+#include "esp_log.h"
+
+extern "C" void codex_dashboard_start(void);
+
+extern "C" void app_main(void)
+{
+    ESP_LOGI("CodexMain", "Starting Codex display");
+    lv_display_t *display = bsp_display_start();
+    if (display == nullptr) {
+        ESP_LOGE("CodexMain", "Display start failed");
+        return;
+    }
+
+    esp_err_t ret = bsp_display_backlight_on();
+    if (ret != ESP_OK) {
+        ESP_LOGE("CodexMain", "Backlight start failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI("CodexMain", "Display ready, entering LVGL lock");
+    ret = bsp_display_lock(-1);
+    if (ret != ESP_OK) {
+        ESP_LOGE("CodexMain", "LVGL lock failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    codex_dashboard_start();
+    bsp_display_unlock();
+    ESP_LOGI("CodexMain", "Codex UI started");
+}

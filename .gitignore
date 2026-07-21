@@ -1,0 +1,32 @@
+# ESP-IDF generated output
+**/build/
+**/managed_components/
+**/sdkconfig
+**/sdkconfig.old
+**/dependencies.lock.old
+
+# Local logs and runtime state
+*.log
+bridge/status.json
+bridge/__pycache__/
+
+# Device images and private dumps
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+*.dump
+
+# Local credentials and machine-specific overrides
+*local*
+*.secret
+*.secrets
+.env
+.env.*
+
+# Editors and OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
