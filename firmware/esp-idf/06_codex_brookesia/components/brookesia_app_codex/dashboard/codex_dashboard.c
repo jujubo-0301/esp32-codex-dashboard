@@ -607,11 +607,6 @@ static void wifi_init(void)
     if (!s_wifi_events) {
         s_wifi_events = xEventGroupCreate();
     }
-    if (CODEX_WIFI_SSID[0] == '\0') {
-        ESP_LOGW(TAG, "WiFi credentials are empty; live status is disabled");
-        return;
-    }
-
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -698,6 +693,10 @@ static void wifi_init(void)
     }
     s_wifi_initialized = true;
     ESP_LOGI(TAG, "[DEBUG-WIFI] WiFi init complete");
+    if (wifi_config.sta.ssid[0] == '\0' && CODEX_WIFI_SSID[0] == '\0') {
+        ESP_LOGW(TAG, "No saved WiFi profile; starting Codex-Setup provisioning AP");
+        start_wifi_provisioning();
+    }
 }
 
 static bool fetch_live_status(void)

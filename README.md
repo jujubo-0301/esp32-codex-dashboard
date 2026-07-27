@@ -41,8 +41,9 @@ firmware/esp-idf/06_codex_brookesia/build/partition_table/partition-table.bin
 ## Wi-Fi
 
 固件默认优先读取原厂固件保存的共享 Wi-Fi 配置，不需要把密码写进源码。
-如果没有保存的配置，可以在本地未提交的 `codex_config.h` 中填写临时测试值；
-不要把真实密码提交到 GitHub。
+如果没有保存的配置，固件会自动开启 Wi-Fi 热点 `Codex-Setup`，密码为 `codex216`。
+手机连接后打开 `http://192.168.4.1`，填写新的 2.4GHz Wi-Fi 名称和密码即可。
+也可以在本地未提交的 `codex_config.h` 中填写临时测试值；不要把真实密码提交到 GitHub。
 
 ## 电脑端桥接
 
