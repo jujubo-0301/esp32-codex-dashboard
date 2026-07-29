@@ -106,13 +106,6 @@ idf.py -p COM3 flash
 
 ```powershell
 cd bridge
-py -3 -m pip install -r requirements.txt
-python codex_status_bridge.py
-```
-
-如果没有 `requirements.txt`，直接运行也可以：
-
-```powershell
 python codex_status_bridge.py
 ```
 
