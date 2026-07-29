@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -312,8 +314,13 @@ static void apply_status_json(const char *payload, size_t length)
     s_status.last_update_ms = esp_log_timestamp();
 
     if (state_changed) {
-        s_manual_page = false;
-        s_page = page_for_state(next_state);
+        /* A bridge state update must not pull the user out of Wi-Fi setup.
+         * The old behavior treated the settings page as an auto page and
+         * made "配置中" appear to flash away immediately. */
+        if (s_page != PAGE_SETTINGS && !s_provisioning_active) {
+            s_manual_page = false;
+            s_page = page_for_state(next_state);
+        }
     } else if (!s_manual_page) {
         s_page = page_for_state(next_state);
     }
@@ -509,46 +516,205 @@ static bool save_factory_wifi_profile(const char *ssid, const char *password)
 
 static void provisioning_reply(int client, const char *body)
 {
-    char response[1024];
-    int length = snprintf(response, sizeof(response),
+    size_t body_length = body ? strlen(body) : 0;
+    size_t response_size = body_length + 192;
+    char *response = malloc(response_size);
+    if (!response) return;
+    int length = snprintf(response, response_size,
                           "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
-                          "Connection: close\r\n\r\n%s", body);
+                          "Connection: close\r\n\r\n%s", body ? body : "");
     if (length > 0) send(client, response, (size_t)length, 0);
+    free(response);
+}
+
+static bool form_append(char *form, size_t form_size, size_t *used, const char *format, ...)
+{
+    if (*used >= form_size) return false;
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(form + *used, form_size - *used, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= form_size - *used) return false;
+    *used += (size_t)written;
+    return true;
+}
+
+static bool form_append_html_escaped(char *form, size_t form_size, size_t *used, const char *text)
+{
+    for (const unsigned char *cursor = (const unsigned char *)text; *cursor; cursor++) {
+        switch (*cursor) {
+        case '&': if (!form_append(form, form_size, used, "&amp;")) return false; break;
+        case '<': if (!form_append(form, form_size, used, "&lt;")) return false; break;
+        case '>': if (!form_append(form, form_size, used, "&gt;")) return false; break;
+        case '\"': if (!form_append(form, form_size, used, "&quot;")) return false; break;
+        case '\'': if (!form_append(form, form_size, used, "&#39;")) return false; break;
+        default: if (!form_append(form, form_size, used, "%c", *cursor)) return false; break;
+        }
+    }
+    return true;
+}
+
+static uint16_t scan_nearby_wifi(wifi_ap_record_t *records, uint16_t record_capacity)
+{
+    if (record_capacity == 0 || esp_wifi_scan_start(NULL, true) != ESP_OK) return 0;
+    uint16_t available = 0;
+    if (esp_wifi_scan_get_ap_num(&available) != ESP_OK || available == 0) return 0;
+    uint16_t count = available < record_capacity ? available : record_capacity;
+    if (esp_wifi_scan_get_ap_records(&count, records) != ESP_OK) return 0;
+    return count;
+}
+
+static void build_wifi_setup_form(char *form, size_t form_size)
+{
+    wifi_config_t saved_profile = {0};
+    bool has_saved_profile = load_factory_wifi_profile(&saved_profile);
+    wifi_ap_record_t nearby[10] = {0};
+    uint16_t nearby_count = scan_nearby_wifi(nearby, 10);
+    size_t used = 0;
+    form[0] = '\0';
+    form_append(form, form_size, &used,
+        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Codex Wi-Fi</title><style>body{font:17px system-ui;margin:22px;background:#07111e;color:#eef6ff}"
+        "select,input,button{box-sizing:border-box;width:100%%;padding:14px;margin:8px 0;border-radius:10px;border:1px solid #29475a;font-size:17px;background:#102235;color:#eef6ff}"
+        "button{background:#42e8ff;color:#07111e;border:0;font-weight:700}.sub{color:#9ab1c5;font-size:14px}.refresh{background:#1a3448;color:#d8f6ff}</style>"
+        "<h2>Codex Wi-Fi</h2><p>&#36873;&#25321;&#32593;&#32476;&#65292;&#21482;&#38656;&#36755;&#20837;&#23494;&#30721;&#12290;</p>"
+        "<form method=post><label>&#38468;&#36817;&#30340; 2.4GHz Wi-Fi</label><select name=ssid required>");
+    if (has_saved_profile) {
+        form_append(form, form_size, &used, "<option selected value='");
+        form_append_html_escaped(form, form_size, &used, (const char *)saved_profile.sta.ssid);
+        form_append(form, form_size, &used, "'>&#24050;&#20445;&#23384;&#65306;");
+        form_append_html_escaped(form, form_size, &used, (const char *)saved_profile.sta.ssid);
+        form_append(form, form_size, &used, "</option>");
+    }
+    for (uint16_t i = 0; i < nearby_count; i++) {
+        const char *ssid = (const char *)nearby[i].ssid;
+        if (ssid[0] == '\0' || (has_saved_profile && strcmp(ssid, (const char *)saved_profile.sta.ssid) == 0)) continue;
+        form_append(form, form_size, &used, "<option value='");
+        form_append_html_escaped(form, form_size, &used, ssid);
+        form_append(form, form_size, &used, "'>");
+        form_append_html_escaped(form, form_size, &used, ssid);
+        form_append(form, form_size, &used, " &middot; %d dBm%s</option>", nearby[i].rssi,
+                    nearby[i].authmode == WIFI_AUTH_OPEN ? " &middot; &#24320;&#25918;" : "");
+    }
+    if (!has_saved_profile && nearby_count == 0) {
+        form_append(form, form_size, &used, "<option disabled selected>&#26410;&#25195;&#25551;&#21040;&#32593;&#32476;&#65292;&#35831;&#21047;&#26032;</option>");
+    }
+    form_append(form, form_size, &used,
+        "</select><button class=refresh type=button onclick='location.reload()'>&#21047;&#26032;&#38468;&#36817;&#32593;&#32476;</button>"
+        "<label>&#25152;&#36873;&#32593;&#32476;&#30340;&#23494;&#30721;</label><input name=password type=password autocomplete=current-password placeholder='Wi-Fi password'>"
+        "<p class=sub>&#23494;&#30721;&#21482;&#29992;&#20110;&#36830;&#25509;&#25152;&#36873;&#32593;&#32476;&#12290;</p>"
+        "<button type=submit>&#20445;&#23384;&#24182;&#36830;&#25509;</button></form>");
+}
+
+/* Answer every DNS query with the local setup page. Together with the DHCP
+ * captive-portal hint this makes phones open the configuration page directly
+ * after joining Codex-Setup. */
+static void captive_dns_task(void *arg)
+{
+    (void)arg;
+    int server = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (server < 0) {
+        vTaskDelete(NULL);
+        return;
+    }
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(53),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(server);
+        vTaskDelete(NULL);
+        return;
+    }
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(server, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    while (s_provisioning_active) {
+        uint8_t request[512];
+        struct sockaddr_in client = {0};
+        socklen_t client_len = sizeof(client);
+        int length = recvfrom(server, request, sizeof(request), 0,
+                              (struct sockaddr *)&client, &client_len);
+        if (length < 17 || request[4] == 0 || request[5] == 0) continue;
+        size_t question_end = 12;
+        while (question_end < (size_t)length && request[question_end] != 0) {
+            question_end += (size_t)request[question_end] + 1;
+        }
+        question_end += 5; /* terminating zero plus QTYPE and QCLASS */
+        if (question_end > (size_t)length || question_end + 16 > sizeof(request)) continue;
+        uint8_t response[512] = {0};
+        memcpy(response, request, question_end);
+        response[2] = 0x81; /* response, recursion available */
+        response[3] = 0x80;
+        response[6] = 0x00;
+        response[7] = 0x01; /* one answer */
+        size_t pos = question_end;
+        response[pos++] = 0xC0;
+        response[pos++] = 0x0C;
+        response[pos++] = 0x00;
+        response[pos++] = 0x01; /* A */
+        response[pos++] = 0x00;
+        response[pos++] = 0x01; /* IN */
+        response[pos++] = 0x00;
+        response[pos++] = 0x00;
+        response[pos++] = 0x00;
+        response[pos++] = 0x3C; /* 60 seconds */
+        response[pos++] = 0x00;
+        response[pos++] = 0x04;
+        response[pos++] = 192;
+        response[pos++] = 168;
+        response[pos++] = 4;
+        response[pos++] = 1;
+        sendto(server, response, pos, 0, (struct sockaddr *)&client, client_len);
+    }
+    close(server);
+    vTaskDelete(NULL);
 }
 
 static void wifi_provision_task(void *arg)
 {
     (void)arg;
-    const char *form =
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<title>Codex Wi-Fi</title><style>body{font:18px system-ui;margin:28px;background:#07111e;color:#eef6ff}"
-        "input,button{box-sizing:border-box;width:100%;padding:14px;margin:8px 0;border-radius:8px;border:0;font-size:17px}"
-        "button{background:#42e8ff;color:#07111e;font-weight:700}</style>"
-        "<h2>Codex Wi-Fi</h2><p>&#35774;&#32622;&#26032;&#30340; 2.4GHz Wi-Fi</p>"
-        "<form method=post><input name=ssid placeholder='Wi-Fi name (SSID)' required>"
-        "<input name=password type=password placeholder='Password'><button>&#20445;&#23384;&#24182;&#36830;&#25509;</button></form>";
-
     wifi_config_t ap_config = {0};
     strlcpy((char *)ap_config.ap.ssid, "Codex-Setup", sizeof(ap_config.ap.ssid));
-    strlcpy((char *)ap_config.ap.password, "codex216", sizeof(ap_config.ap.password));
     ap_config.ap.ssid_len = strlen((char *)ap_config.ap.ssid);
     ap_config.ap.channel = 1;
     ap_config.ap.max_connection = 2;
-    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
     if (!s_wifi_ap_netif) s_wifi_ap_netif = esp_netif_create_default_wifi_ap();
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
-    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    esp_wifi_start();
+    esp_netif_dns_info_t dns = {0};
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    dns.ip.u_addr.ip4.addr = inet_addr("192.168.4.1");
+    esp_netif_set_dns_info(s_wifi_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+    uint8_t offer_dns = 1;
+    esp_netif_dhcps_option(s_wifi_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                           &offer_dns, sizeof(offer_dns));
+    static const char captive_portal_uri[] = "http://192.168.4.1/";
+    esp_netif_dhcps_option(s_wifi_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
+                           (void *)captive_portal_uri, sizeof(captive_portal_uri));
+    esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_err_t config_err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    esp_err_t start_err = esp_wifi_start();
+    ESP_LOGI(TAG, "[DEBUG-WIFI-PROV] mode=%s config=%s start=%s",
+             esp_err_to_name(mode_err), esp_err_to_name(config_err), esp_err_to_name(start_err));
+    xTaskCreate(captive_dns_task, "captive_dns", 3072, NULL, 3, NULL);
 
-    int server = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (server < 0) goto finish;
-    int reuse = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    int server = -1;
     struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(80), .sin_addr.s_addr = htonl(INADDR_ANY)};
-    if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(server, 2) != 0) {
-        close(server);
-        goto finish;
+    while (!s_provisioning_stop) {
+        server = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (server >= 0) {
+            int reuse = 1;
+            setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+            if (bind(server, (struct sockaddr *)&address, sizeof(address)) == 0 && listen(server, 2) == 0) break;
+            close(server);
+            server = -1;
+        }
+        ESP_LOGW(TAG, "[DEBUG-WIFI-PROV] HTTP server not ready; retrying");
+        strlcpy(s_status.message, "WiFi 配置服务启动中", sizeof(s_status.message));
+        schedule_render();
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
+    if (server < 0) goto finish;
     struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
     setsockopt(server, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     while (!s_provisioning_stop) {
@@ -571,7 +737,14 @@ static void wifi_provision_task(void *arg)
                 provisioning_reply(client, "<meta charset=utf-8><h2>&#20445;&#23384;&#22833;&#36133;</h2><p>SSID &#19981;&#33021;&#20026;&#31354;&#12290;</p>");
             }
         } else {
-            provisioning_reply(client, form);
+            char *form = malloc(4096);
+            if (form) {
+                build_wifi_setup_form(form, 4096);
+                provisioning_reply(client, form);
+                free(form);
+            } else {
+                provisioning_reply(client, "<meta charset=utf-8><h2>WiFi &#35774;&#32622;&#20869;&#23384;&#19981;&#36275;</h2>");
+            }
         }
         close(client);
     }
@@ -738,8 +911,9 @@ static void status_poll_task(void *arg)
             s_status.recent_task_count = 0;
             s_status.last_update_ms = 0;
             strlcpy(s_status.message, "无法连接电脑端状态服务", sizeof(s_status.message));
-            s_manual_page = false;
-            s_page = PAGE_OFFLINE;
+            if (!s_manual_page) {
+                s_page = PAGE_OFFLINE;
+            }
             schedule_render();
         }
         vTaskDelay(pdMS_TO_TICKS(WIFI_STATUS_POLL_MS));
@@ -1255,14 +1429,11 @@ static void setting_event_cb(lv_event_t *event)
         s_status.message[0] = '\0';
         if (!s_wifi_initialized) {
             wifi_init();
-            start_wifi_provisioning();
-        } else if (!s_wifi_connected) {
-            start_wifi_provisioning();
-        } else {
-            esp_wifi_disconnect();
-            esp_wifi_connect();
         }
-        strlcpy(s_status.message, "正在重新连接 WiFi", sizeof(s_status.message));
+        if (!s_provisioning_active) {
+            start_wifi_provisioning();
+        }
+        strlcpy(s_status.message, "正在打开 WiFi 配置", sizeof(s_status.message));
     } else if (setting == 1) {
         if (s_wifi_connected) {
             s_bridge_discovery_started = true;
@@ -1582,9 +1753,9 @@ static void render_page(void)
     snprintf(brightness_text, sizeof(brightness_text), "%d%%", s_brightness);
     if (s_time_offset_hours == 0) strlcpy(time_text, "电脑同步", sizeof(time_text));
     else snprintf(time_text, sizeof(time_text), "%+dh", s_time_offset_hours);
-    const char *setting_names[] = {"WiFi 状态", "电脑端桥接", "主题颜色", "运行提示", "屏幕亮度", "时间调整"};
+    const char *setting_names[] = {"WiFi 设置", "电脑端桥接", "主题颜色", "运行提示", "屏幕亮度", "时间调整"};
     const char *setting_values[] = {
-        s_wifi_connected ? "已连接" : "未连接",
+        s_provisioning_active ? "配置中" : (s_wifi_connected ? "已连接" : "未连接"),
         s_status.connected ? "在线" : "离线",
         s_alt_theme ? "柔和黑" : "深色",
         s_sound_enabled ? "声音+画面" : "仅画面",
@@ -1598,7 +1769,7 @@ static void render_page(void)
         mini_status_icon(settings, 16, y - 1, setting_colors[i], setting_symbols[i]);
         text(settings, setting_names[i], 58, y, 190, 30, color_text(), 16);
         text(settings, setting_values[i], 274, y, 122, 30,
-             (i == 0 && !s_wifi_connected) || (i == 1 && !s_status.connected) ? color_muted() : color_text(), 16);
+             (i == 0 && !s_wifi_connected && !s_provisioning_active) || (i == 1 && !s_status.connected) ? color_muted() : color_text(), 16);
         if (i < 5) divider(settings, 14, y + 34, 404);
         /* Create the transparent hit target last so labels/icons cannot steal
          * the touch event from the settings row. */
